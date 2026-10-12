@@ -1,8 +1,7 @@
 import os
-import json
+import asyncio
 import random
 import time
-import asyncio
 from http.server import BaseHTTPRequestHandler
 
 from aiogram import Bot, Dispatcher
@@ -66,6 +65,10 @@ MESSAGES = [
     "🥶 Холодно? Согреемся суетой!",
 ]
 
+# ---- Один общий event loop на весь «холодный старт» функции ----
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 last_used: dict[int, float] = {}
@@ -89,28 +92,32 @@ async def messbot_handler(message: Message):
     await message.answer(random.choice(MESSAGES))
 
 
+def _process_update(update: Update):
+    try:
+        _loop.run_until_complete(dp.feed_update(bot, update))
+    except Exception as e:
+        print("PROCESS ERROR:", repr(e))
+
+
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
             update = Update.model_validate_json(body)
-
-            asyncio.run(dp.feed_update(bot, update))
-
+            _process_update(update)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"ok": true}')
         except Exception as e:
-            print("ERROR:", e)
+            print("HANDLER ERROR:", repr(e))
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"ok": true}')
 
     def do_GET(self):
-        # Health-check, чтобы можно было открыть в браузере
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
