@@ -7,10 +7,14 @@ from http.server import BaseHTTPRequestHandler
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, Update
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
 
 # ==== НАСТРОЙКИ ====
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-COOLDOWN_SECONDS = 7
+COOLDOWN_SECONDS = 7       # обычный кулдаун на чат
+SPAM_WINDOW = 5            # окно подсчёта спама (сек)
+SPAM_THRESHOLD = 3         # 3+ команды за окно = спам
+SPAM_BLOCK_SECONDS = 10    # блокировка спамера (сек)
 # ===================
 
 MESSAGES = [
@@ -65,36 +69,98 @@ MESSAGES = [
     "🥶 Холодно? Согреемся суетой!",
 ]
 
-# ---- Один общий event loop на весь «холодный старт» функции ----
-_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_loop)
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-last_used: dict[int, float] = {}
+
+chat_cooldown: dict[int, float] = {}
+user_block: dict[int, float] = {}
+user_history: dict[int, list[float]] = {}
+
+
+async def safe_send(coro):
+    try:
+        await coro
+    except TelegramRetryAfter as e:
+        print(f"FLOOD WAIT: {e.retry_after}s")
+        await asyncio.sleep(e.retry_after + 0.5)
+        try:
+            await coro
+        except Exception as e2:
+            print("RETRY FAILED:", repr(e2))
+    except TelegramAPIError as e:
+        print("TELEGRAM API ERROR:", repr(e))
+    except Exception as e:
+        print("SEND ERROR:", repr(e))
 
 
 @dp.message(Command("messbot"))
 async def messbot_handler(message: Message):
-    chat_id = message.chat.id
     now = time.monotonic()
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
 
-    if chat_id in last_used:
-        elapsed = now - last_used[chat_id]
+    # === 1. Проверка: заблокирован ли пользователь за спам ===
+    if user_id in user_block:
+        remaining = user_block[user_id] - now
+        if remaining > 0:
+            await safe_send(
+                message.reply(f"🚫 Слишком много команд! Жди {int(remaining) + 1} сек.")
+            )
+            return
+        else:
+            del user_block[user_id]
+
+    # === 2. Считаем команды пользователя за окно ===
+    history = user_history.setdefault(user_id, [])
+    history[:] = [t for t in history if now - t < SPAM_WINDOW]
+    history.append(now)
+
+    # 3 и больше команд за 5 секунд = спам
+    if len(history) >= SPAM_THRESHOLD:
+        user_block[user_id] = now + SPAM_BLOCK_SECONDS
+        user_history[user_id] = []
+        print(f"SPAM BLOCK: user={user_id} chat={chat_id}")
+        await safe_send(
+            message.reply(
+                f"🚫 Слишком много команд! Блок на {SPAM_BLOCK_SECONDS} сек."
+            )
+        )
+        return
+
+    # === 3. Обычный кулдаун на чат ===
+    if chat_id in chat_cooldown:
+        elapsed = now - chat_cooldown[chat_id]
         if elapsed < COOLDOWN_SECONDS:
             remaining = int(COOLDOWN_SECONDS - elapsed) + 1
-            await message.reply(
-                f"⏳ Подожди ещё {remaining} сек., я коплю энергию для суеты!"
+            await safe_send(
+                message.reply(
+                    f"⏳ Подожди ещё {remaining} сек., я коплю энергию для суеты!"
+                )
             )
             return
 
-    last_used[chat_id] = now
-    await message.answer(random.choice(MESSAGES))
+    # === 4. Отвечаем ===
+    chat_cooldown[chat_id] = now
+    await safe_send(message.answer(random.choice(MESSAGES)))
+
+
+async def _async_process_update(update: Update):
+    await dp.feed_update(bot, update)
 
 
 def _process_update(update: Update):
     try:
-        _loop.run_until_complete(dp.feed_update(bot, update))
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        loop.run_until_complete(_async_process_update(update))
     except Exception as e:
         print("PROCESS ERROR:", repr(e))
 
@@ -106,6 +172,7 @@ class handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             update = Update.model_validate_json(body)
             _process_update(update)
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
